@@ -113,7 +113,10 @@ Full ABIs and the REA static-analysis evidence live in
 ## Terminal UI
 
 When stdout is a terminal (e.g. inside `screen` or `tmux`), the bot shows a
-live UI built with the Python standard library only — no extra packages:
+live UI built with the Python standard library only — no extra packages.
+The UI is width-aware: boxes and the countdown shrink to fit narrow
+terminals (e.g. a phone SSH client), and the countdown redraws once per
+second with an erase-line sequence instead of flooding the scrollback.
 
 - startup banner with wallet, chain and LIVE / DRY_RUN mode
 - colored log levels and a mission progress bar on buys

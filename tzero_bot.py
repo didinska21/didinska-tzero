@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import random
+import shutil
 import sys
 import threading
 import time
@@ -195,7 +196,7 @@ class Spinner:
             sys.stderr.flush()
             i += 1
             self._stop.wait(0.08)
-        sys.stderr.write("\r" + " " * (len(self.label) + 8) + "\r")
+        sys.stderr.write("\r\033[2K")
         sys.stderr.flush()
 
     def __enter__(self):
@@ -208,16 +209,26 @@ class Spinner:
         if self._thread:
             self._stop.set()
             self._thread.join(timeout=1)
+            sys.stderr.write("\r\033[2K")  # erase the spinner line cleanly
+            sys.stderr.flush()
         return False
 
 def live_countdown(seconds: int) -> None:
-    """Animated wait between cycles: spinner + countdown + draining bar."""
+    """Animated wait between cycles: spinner + countdown + draining bar.
+
+    Width-aware: the frame is rebuilt at most once per displayed second and
+    is always truncated to the terminal width, then redrawn with an
+    erase-line sequence. On narrow terminals (phones) a wrapped frame would
+    defeat the carriage return and stack one line per frame — the compact
+    layout below avoids that.
+    """
     if not FANCY:
         time.sleep(seconds)
         return
     words = ["watching the curve", "holding positions", "scanning for liftoffs",
              "guarding the wallet", "waiting for the next block party"]
     start = time.monotonic()
+    last_shown = None
     i = 0
     try:
         while True:
@@ -225,20 +236,32 @@ def live_countdown(seconds: int) -> None:
             remaining = seconds - elapsed
             if remaining <= 0:
                 break
-            mm, ss = divmod(int(remaining) + 1, 60)
+            shown = int(remaining) + 1
+            if shown == last_shown:
+                time.sleep(0.1)
+                continue
+            last_shown = shown
+            mm, ss = divmod(shown, 60)
             pct = elapsed / seconds * 100
             frame = Spinner.FRAMES[i % len(Spinner.FRAMES)]
-            word = words[(i // 40) % len(words)]
-            line = (f"\r{paint(frame, CYAN, BOLD)} {paint('next cycle in', DIM)} "
-                    f"{paint(f'{mm:02d}:{ss:02d}', BOLD)}  "
-                    f"{paint(progress_bar(pct, 24), CYAN)} {pct:4.1f}%  "
-                    f"{paint('· ' + word, DIM)}")
-            sys.stdout.write(line + "   ")
+            word = words[(i // 4) % len(words)]
+            width = max(20, _term_width() - 1)
+            if width >= 56:
+                bar_w = min(24, width - 40)
+                line = (f"{paint(frame, CYAN, BOLD)} {paint('next cycle in', DIM)} "
+                        f"{paint(f'{mm:02d}:{ss:02d}', BOLD)}  "
+                        f"{paint(progress_bar(pct, bar_w), CYAN)} {pct:4.1f}%  "
+                        f"{paint('· ' + word, DIM)}")
+            else:  # compact: spinner + time + percent only, always fits
+                line = (f"{paint(frame, CYAN, BOLD)} {paint('next', DIM)} "
+                        f"{paint(f'{mm:02d}:{ss:02d}', BOLD)} "
+                        f"{paint(f'{pct:4.1f}%', CYAN)}")
+            sys.stdout.write("\r\033[2K" + _truncate_vis(line, width))
             sys.stdout.flush()
             i += 1
             time.sleep(0.1)
     finally:
-        sys.stdout.write("\r" + " " * 110 + "\r")
+        sys.stdout.write("\r\033[2K")
         sys.stdout.flush()
 
 import re as _re
@@ -251,9 +274,39 @@ def _vislen(s: str) -> int:
         w += 2 if ord(ch) >= 0x1F000 or ch in _WIDE else 1
     return w
 
-def _box(rows: list, width: int = 62) -> None:
+def _term_width() -> int:
+    try:
+        return shutil.get_terminal_size().columns
+    except Exception:  # noqa: BLE001
+        return 80
+
+def _truncate_vis(s: str, limit: int) -> str:
+    """Truncate to `limit` visible columns, keeping ANSI codes intact."""
+    if _vislen(s) <= limit:
+        return s
+    out, w, i = [], 0, 0
+    while i < len(s):
+        if s[i] == "\x1b":  # ANSI sequence: copy through, zero width
+            j = i + 1
+            while j < len(s) and not s[j].isalpha():
+                j += 1
+            out.append(s[i:j + 1])
+            i = j + 1
+            continue
+        cw = 2 if ord(s[i]) >= 0x1F000 or s[i] in _WIDE else 1
+        if w + cw > limit:
+            break
+        out.append(s[i])
+        w += cw
+        i += 1
+    return "".join(out) + (RESET if FANCY else "")
+
+def _box(rows: list, width: int = None) -> None:
+    if width is None:
+        width = min(62, max(24, _term_width() - 2))
     print(paint("╭" + "─" * width + "╮", CYAN), flush=True)
     for r in rows:
+        r = _truncate_vis(r, width)
         pad = max(0, width - _vislen(r))
         print(paint("│", CYAN) + r + " " * pad + paint("│", CYAN), flush=True)
     print(paint("╰" + "─" * width + "╯", CYAN), flush=True)
@@ -294,7 +347,7 @@ def print_panel(bot, summary: dict) -> None:
         f"  🏆 Rank      {('#' + str(rank)) if rank else '—'}  ·  " +
         (paint("✅ eligible", GREEN) if elig else paint("not eligible yet", YELLOW)),
         f"  🛒 Buys      {day_count(bot.state, 'buys')}/{MAX_BUYS_PER_DAY} today  ·  "
-        f"{paint(str(len(bot.state['buys'])) + ' missions backed in total', DIM)}",
+        f"{paint(str(sum(1 for b in bot.state['buys'] if not b.get('dryRun'))) + ' missions backed in total', DIM)}",
     ])
 
 # --------------------------------------------------------------------------
@@ -429,7 +482,15 @@ class Bot:
         with Spinner(f"broadcasting {label} & waiting for confirmation"):
             h = self.w3.eth.send_raw_transaction(signed.raw_transaction)
             txh = h.hex()
-            receipt = self.w3.eth.wait_for_transaction_receipt(h, timeout=180)
+            try:
+                receipt = self.w3.eth.wait_for_transaction_receipt(h, timeout=180)
+            except Exception as e:  # noqa: BLE001 — tx is out; don't crash the cycle
+                # The transaction was broadcast and may well have landed.
+                # Return the hash so callers record it (recording prevents a
+                # duplicate send next cycle, which is the worse failure).
+                log.warning("%s broadcast as %s but receipt wait failed (%s); "
+                            "treating as sent, verify on the explorer", label, txh, e)
+                return txh
         log.info("%s sent: %s", label, txh)
         if receipt.status != 1:
             log.error("%s REVERTED on-chain: %s", label, txh)
@@ -442,7 +503,11 @@ class Bot:
         return self.w3.eth.get_balance(self.address) / 1e18
 
     def pick_candidate(self, closest: list) -> dict | None:
-        bought = {b["token"].lower() for b in self.state["buys"]}
+        # Only REAL buys block a token. Dry-run records are simulations:
+        # letting them block would silently skip those missions forever
+        # after flipping DRY_RUN off with the same state.json.
+        bought = {b["token"].lower() for b in self.state["buys"]
+                  if not b.get("dryRun")}
         for m in closest:
             if m.get("graduated"):
                 continue
@@ -482,11 +547,13 @@ class Bot:
             self.launchpad.functions.buy(token, min_out),
             value_wei=amount_wei, label=f"buy {m['symbol']}")
         if DRY_RUN:
+            # Record the simulation for visibility, but do NOT bump the
+            # daily counter: dry-run buys must not eat the live daily cap
+            # after DRY_RUN is flipped off on the same day.
             self.state["buys"].append({
                 "token": m["token"], "symbol": m["symbol"],
                 "amountEth": BUY_AMOUNT_ETH, "ts": int(time.time()),
                 "txHash": None, "dryRun": True})
-            bump_day(self.state, "buys")
             save_state(self.state)
         elif txh:
             self.state["buys"].append({
@@ -504,10 +571,16 @@ class Bot:
                     self.address, Web3.to_checksum_address(STAKING)).call()
                 if allow < bal:
                     log.info("approving staking contract for %s T0", bal / 1e18)
-                    self.send(self.t0.functions.approve(
+                    atxh = self.send(self.t0.functions.approve(
                         Web3.to_checksum_address(STAKING), bal), label="approve T0")
-                log.info("staking %s T0", bal / 1e18)
-                self.send(self.staking.functions.stake(bal), label="stake T0")
+                    if not DRY_RUN and atxh is None:
+                        # Approve reverted: staking now would just burn gas
+                        # on a second revert. Retry next cycle instead.
+                        log.warning("approve failed — skipping stake this cycle")
+                        bal = 0
+                if bal > 0:
+                    log.info("staking %s T0", bal / 1e18)
+                    self.send(self.staking.functions.stake(bal), label="stake T0")
         if CLAIM_REWARDS:
             try:
                 pending = self.staking.functions.pending(self.address).call()
