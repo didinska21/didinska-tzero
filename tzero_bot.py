@@ -33,6 +33,7 @@ import logging
 import os
 import random
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -144,14 +145,183 @@ STAKING_ABI = [
 ]
 
 # --------------------------------------------------------------------------
+# Terminal UI (stdlib only — no extra dependencies)
+#
+# Fancy mode (banner, colors, spinners, live countdown, status panel) is on
+# automatically when stdout is a terminal. Force it with UI=fancy, or turn
+# it off with UI=plain (plain mode = clean log lines, best for systemd).
+# --------------------------------------------------------------------------
+
+_ui_mode = os.getenv("UI", "auto").strip().lower()
+FANCY = (_ui_mode == "fancy") or (_ui_mode == "auto" and sys.stdout.isatty())
+
+RESET = "\033[0m"; BOLD = "\033[1m"; DIM = "\033[2m"
+RED = "\033[31m"; GREEN = "\033[32m"; YELLOW = "\033[33m"
+BLUE = "\033[34m"; MAGENTA = "\033[35m"; CYAN = "\033[36m"
+
+def paint(text: str, *codes: str) -> str:
+    if not FANCY:
+        return text
+    return "".join(codes) + text + RESET
+
+def fmt_num(x) -> str:
+    if x is None:
+        return "—"
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return str(x)
+    s = f"{f:,.2f}"
+    return s.rstrip("0").rstrip(".") if "." in s else s
+
+def progress_bar(pct: float, width: int = 18) -> str:
+    filled = int(round(max(0.0, min(100.0, pct)) / 100 * width))
+    return "█" * filled + "░" * (width - filled)
+
+class Spinner:
+    """Braille spinner on stderr (same stream as the logs) while work runs."""
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, label: str):
+        self.label = label
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _spin(self) -> None:
+        i = 0
+        while not self._stop.is_set():
+            frame = self.FRAMES[i % len(self.FRAMES)]
+            sys.stderr.write(f"\r{paint(frame, CYAN, BOLD)} {self.label}… ")
+            sys.stderr.flush()
+            i += 1
+            self._stop.wait(0.08)
+        sys.stderr.write("\r" + " " * (len(self.label) + 8) + "\r")
+        sys.stderr.flush()
+
+    def __enter__(self):
+        if FANCY:
+            self._thread = threading.Thread(target=self._spin, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        if self._thread:
+            self._stop.set()
+            self._thread.join(timeout=1)
+        return False
+
+def live_countdown(seconds: int) -> None:
+    """Animated wait between cycles: spinner + countdown + draining bar."""
+    if not FANCY:
+        time.sleep(seconds)
+        return
+    words = ["watching the curve", "holding positions", "scanning for liftoffs",
+             "guarding the wallet", "waiting for the next block party"]
+    start = time.monotonic()
+    i = 0
+    try:
+        while True:
+            elapsed = time.monotonic() - start
+            remaining = seconds - elapsed
+            if remaining <= 0:
+                break
+            mm, ss = divmod(int(remaining) + 1, 60)
+            pct = elapsed / seconds * 100
+            frame = Spinner.FRAMES[i % len(Spinner.FRAMES)]
+            word = words[(i // 40) % len(words)]
+            line = (f"\r{paint(frame, CYAN, BOLD)} {paint('next cycle in', DIM)} "
+                    f"{paint(f'{mm:02d}:{ss:02d}', BOLD)}  "
+                    f"{paint(progress_bar(pct, 24), CYAN)} {pct:4.1f}%  "
+                    f"{paint('· ' + word, DIM)}")
+            sys.stdout.write(line + "   ")
+            sys.stdout.flush()
+            i += 1
+            time.sleep(0.1)
+    finally:
+        sys.stdout.write("\r" + " " * 110 + "\r")
+        sys.stdout.flush()
+
+import re as _re
+_ANSI_RE = _re.compile(r"\x1b\[[0-9;]*m")
+_WIDE = set("🥔🎯🏆🛒💰📊🔄●✅⏭🚀")
+
+def _vislen(s: str) -> int:
+    w = 0
+    for ch in _ANSI_RE.sub("", s):
+        w += 2 if ord(ch) >= 0x1F000 or ch in _WIDE else 1
+    return w
+
+def _box(rows: list, width: int = 62) -> None:
+    print(paint("╭" + "─" * width + "╮", CYAN), flush=True)
+    for r in rows:
+        pad = max(0, width - _vislen(r))
+        print(paint("│", CYAN) + r + " " * pad + paint("│", CYAN), flush=True)
+    print(paint("╰" + "─" * width + "╯", CYAN), flush=True)
+
+def print_banner(bot) -> None:
+    if not FANCY:
+        return
+    mode = paint("● LIVE — real transactions", GREEN, BOLD) if not DRY_RUN \
+        else paint("● DRY_RUN — simulation only", YELLOW, BOLD)
+    short = f"{bot.address[:6]}…{bot.address[-4:]}"
+    _box([
+        "",
+        paint("  🥔  TZERO BOT", BOLD, CYAN) + paint("  ·  Season 0 Points Runner", DIM),
+        paint("  ────────────────────────────────────────────────", DIM),
+        f"  Wallet   {paint(short, BOLD)}",
+        "  Chain    Base Sepolia (84532)",
+        f"  Mode     {mode}",
+        f"  Cycle    ~{LOOP_INTERVAL_SEC}s ± {JITTER_SEC}s · buys ≤ {MAX_BUYS_PER_DAY}/day · stake $T0 {'on' if STAKE_T0 else 'off'}",
+        "",
+    ])
+
+def print_panel(bot, summary: dict) -> None:
+    if not FANCY or not summary:
+        return
+    pts = summary.get("points") or {}
+    bal = summary.get("bal")
+    total = fmt_num(pts.get("total")) if pts else "—"
+    parts = []
+    if pts:
+        parts = [f"Fuel {fmt_num(pts.get('fuel'))}", f"Crew {fmt_num(pts.get('crew'))}",
+                 f"Liftoff {fmt_num(pts.get('liftoff'))}", f"Staking {fmt_num(pts.get('staking'))}"]
+    rank = pts.get("rank")
+    elig = pts.get("eligible")
+    _box([
+        paint(f"  📊 STATUS · cycle #{bot.cycle_no} · {datetime.now():%H:%M:%S}", BOLD),
+        f"  💰 Balance   {paint(f'{bal:.6f} ETH' if bal is not None else '—', BOLD)}",
+        f"  🎯 Points    {paint(total, BOLD, CYAN)}" + (paint("  (" + " · ".join(parts) + ")", DIM) if parts else ""),
+        f"  🏆 Rank      {('#' + str(rank)) if rank else '—'}  ·  " +
+        (paint("✅ eligible", GREEN) if elig else paint("not eligible yet", YELLOW)),
+        f"  🛒 Buys      {day_count(bot.state, 'buys')}/{MAX_BUYS_PER_DAY} today  ·  "
+        f"{paint(str(len(bot.state['buys'])) + ' missions backed in total', DIM)}",
+    ])
+
+# --------------------------------------------------------------------------
 # Logging / state
 # --------------------------------------------------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S%z",
-)
+class _ColorFmt(logging.Formatter):
+    LEVEL_COLORS = {logging.DEBUG: DIM, logging.INFO: CYAN,
+                    logging.WARNING: YELLOW, logging.ERROR: RED,
+                    logging.CRITICAL: RED + BOLD}
+
+    def format(self, record):
+        if FANCY:
+            orig = record.levelname
+            record.levelname = paint(f"{orig:<7}", self.LEVEL_COLORS.get(record.levelno, ""))
+            try:
+                out = super().format(record)
+            finally:
+                record.levelname = orig
+            return out.replace("[DRY_RUN]", paint("[DRY_RUN]", MAGENTA, BOLD))
+        return super().format(record)
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(_ColorFmt(
+    fmt="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S%z"))
+logging.basicConfig(level=logging.INFO, handlers=[_handler])
 log = logging.getLogger("tzero-bot")
 
 def load_state() -> dict:
@@ -231,6 +401,7 @@ class Bot:
         self.t0 = self.w3.eth.contract(
             address=Web3.to_checksum_address(T0_TOKEN), abi=ERC20_ABI)
         self.state = load_state()
+        self.cycle_no = 0
         log.info("wallet %s | chain %s | DRY_RUN=%s", self.address, chain_id, DRY_RUN)
 
     # -- tx plumbing -------------------------------------------------------
@@ -255,10 +426,11 @@ class Bot:
                      (tx.get("data") or "")[:20])
             return None
         signed = self.acct.sign_transaction(tx)
-        h = self.w3.eth.send_raw_transaction(signed.raw_transaction)
-        txh = h.hex()
+        with Spinner(f"broadcasting {label} & waiting for confirmation"):
+            h = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+            txh = h.hex()
+            receipt = self.w3.eth.wait_for_transaction_receipt(h, timeout=180)
         log.info("%s sent: %s", label, txh)
-        receipt = self.w3.eth.wait_for_transaction_receipt(h, timeout=180)
         if receipt.status != 1:
             log.error("%s REVERTED on-chain: %s", label, txh)
             return None
@@ -302,8 +474,9 @@ class Bot:
             log.info("quoteBuy returned 0 for %s (graduated?) — skipping", m["symbol"])
             return
         min_out = quote * (10_000 - SLIPPAGE_BPS) // 10_000
-        log.info("backing %s (%s) progress %.2f%% with %.4f ETH, quote %s tokens",
-                 m["name"], m["symbol"], (m.get("progressBps") or 0) / 100,
+        pct = (m.get("progressBps") or 0) / 100
+        log.info("backing %s (%s) %s %.2f%% with %.4f ETH, quote %s tokens",
+                 m["name"], m["symbol"], progress_bar(pct), pct,
                  BUY_AMOUNT_ETH, quote / 1e18)
         txh = self.send(
             self.launchpad.functions.buy(token, min_out),
@@ -365,7 +538,11 @@ class Bot:
             save_state(self.state)
 
     # -- main loop -----------------------------------------------------------
-    def cycle(self) -> None:
+    def cycle(self) -> dict:
+        self.cycle_no += 1
+        if FANCY:
+            print(paint(f"\n─── 🔄 cycle #{self.cycle_no} · {datetime.now():%H:%M:%S} "
+                        f"────────────────────────────────", DIM))
         bal = self.balance_eth()
         log.info("balance %.6f ETH | buys today %s/%s",
                  bal, day_count(self.state, "buys"), MAX_BUYS_PER_DAY)
@@ -377,7 +554,8 @@ class Bot:
 
         if (bal - GAS_RESERVE_ETH) >= BUY_AMOUNT_ETH and \
                 day_count(self.state, "buys") < MAX_BUYS_PER_DAY:
-            candidate = self.pick_candidate(fetch_closest())
+            with Spinner("scanning missions closest to liftoff"):
+                candidate = self.pick_candidate(fetch_closest())
             if candidate:
                 self.do_buy(candidate)
             else:
@@ -388,22 +566,30 @@ class Bot:
         self.do_launch()
 
         pts = fetch_points(self.address)
-        if pts:
+        if pts and not FANCY:
             log.info("points: total=%s fuel=%s crew=%s liftoff=%s staking=%s "
                      "eligible=%s rank=%s",
                      pts.get("total"), pts.get("fuel"), pts.get("crew"),
                      pts.get("liftoff"), pts.get("staking"),
                      pts.get("eligible"), pts.get("rank"))
+        return {"bal": bal, "points": pts}
 
     def run(self) -> None:
+        print_banner(self)
         log.info("starting loop: every ~%ss (+/- %ss jitter)", LOOP_INTERVAL_SEC, JITTER_SEC)
         while True:
+            summary = {}
             try:
-                self.cycle()
+                summary = self.cycle() or {}
             except Exception as e:  # noqa: BLE001 — keep the loop alive on a VPS
                 log.exception("cycle failed: %s", e)
-            time.sleep(max(60, LOOP_INTERVAL_SEC + random.randint(-JITTER_SEC, JITTER_SEC)))
+            print_panel(self, summary)
+            live_countdown(max(60, LOOP_INTERVAL_SEC + random.randint(-JITTER_SEC, JITTER_SEC)))
 
 
 if __name__ == "__main__":
-    Bot().run()
+    try:
+        Bot().run()
+    except KeyboardInterrupt:
+        print("\n👋 bot stopped. state.json is saved — safe to resume anytime.")
+        sys.exit(0)

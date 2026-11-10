@@ -109,3 +109,19 @@ the script, so restarts don't double-buy the same mission.
 
 Full ABIs and the REA static-analysis evidence live in
 `../rea-evidence/` (`ANALYSIS.md` there summarises the findings).
+
+## Terminal UI
+
+When stdout is a terminal (e.g. inside `screen` or `tmux`), the bot shows a
+live UI built with the Python standard library only — no extra packages:
+
+- startup banner with wallet, chain and LIVE / DRY_RUN mode
+- colored log levels and a mission progress bar on buys
+- braille spinners while scanning missions and while a transaction waits
+  for on-chain confirmation
+- a status panel after every cycle (balance, points breakdown, rank,
+  buys today)
+- an animated countdown to the next cycle (spinner + draining bar)
+
+Set `UI=plain` in `.env` to disable all of it (plain log lines — best for
+systemd/journald). `UI=fancy` forces the UI even when output is piped.
