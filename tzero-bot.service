@@ -1,0 +1,17 @@
+[Unit]
+Description=Tzero Season 0 helper bot (Base Sepolia testnet)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tzero
+WorkingDirectory=/opt/tzero-bot
+ExecStart=/opt/tzero-bot/.venv/bin/python /opt/tzero-bot/tzero_bot.py
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
